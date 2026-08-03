@@ -2,3 +2,7 @@
 *.DS_Store
 weights/
 __pycache__/
+
+# Generated Avatar inference caches and intermediate audio
+/audio_temp_file_*/
+/outputs_avatar_*/

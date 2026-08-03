@@ -888,6 +888,9 @@ class LongCatVideoAvatarPipeline:
         audio_emb: torch.Tensor = None,
         ref_target_masks: torch.Tensor = None,
         resize_mode: Optional[str] = "crop", # "default" / "crop"
+        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt_attention_mask: Optional[torch.Tensor] = None,
+        condition_latents: Optional[torch.Tensor] = None,
     ):
         r"""
         Generates video frames from an input image and text prompt using diffusion process.
@@ -976,7 +979,14 @@ class LongCatVideoAvatarPipeline:
         # 3. Encode inputs
         dit_dtype = self.dit.dtype
 
-        if context_parallel_util.get_cp_rank() == 0:
+        if prompt_embeds is not None:
+            if prompt_attention_mask is None:
+                raise ValueError("prompt_attention_mask is required with prompt_embeds")
+            prompt_embeds = prompt_embeds.to(device=device, dtype=dit_dtype)
+            prompt_attention_mask = prompt_attention_mask.to(device=device)
+            negative_prompt_embeds = None
+            negative_prompt_attention_mask = None
+        elif context_parallel_util.get_cp_rank() == 0:
             (
                 prompt_embeds, 
                 prompt_attention_mask, 
@@ -1023,13 +1033,18 @@ class LongCatVideoAvatarPipeline:
         timesteps = self.scheduler.timesteps
 
         # 5. Prepare latent variables
-        image = self.video_processor.preprocess(image, height=height, width=width, resize_mode=resize_mode)
-        image = image.to(device=device, dtype=prompt_embeds.dtype)
+        if condition_latents is None:
+            image_or_latents = self.video_processor.preprocess(image, height=height, width=width, resize_mode=resize_mode)
+            image_or_latents = image_or_latents.to(device=device, dtype=prompt_embeds.dtype)
+            need_encode = True
+        else:
+            image_or_latents = condition_latents.to(device=device, dtype=prompt_embeds.dtype)
+            need_encode = False
 
         num_channels_latents = self.dit.config.in_channels
             
         latents = self.prepare_latents(
-            image=image, 
+            image=image_or_latents,
             batch_size=batch_size * num_videos_per_prompt,
             num_channels_latents=num_channels_latents,
             height=height,
@@ -1040,6 +1055,7 @@ class LongCatVideoAvatarPipeline:
             device=device,
             generator=generator,
             latents=latents,
+            need_encode=need_encode,
         )
         if context_parallel_util.get_cp_size() > 1:
             context_parallel_util.cp_broadcast(latents)
@@ -1539,4 +1555,3 @@ class LongCatVideoAvatarPipeline:
         if self.vae is not None:
             self.vae = self.vae.to(device, non_blocking=True)
         return self
-    

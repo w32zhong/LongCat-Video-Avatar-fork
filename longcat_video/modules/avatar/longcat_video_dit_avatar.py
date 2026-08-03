@@ -290,6 +290,18 @@ class LongCatVideoAvatarTransformer3DModel(
 
         self.lora_dict = {}
         self.active_loras = []
+        self.sequential_block_cpu_offload = False
+        self.block_offload_device = None
+
+    def enable_sequential_block_cpu_offload(self, device):
+        """Keep transformer blocks on CPU and stage one block at a time on GPU."""
+        self.sequential_block_cpu_offload = True
+        self.block_offload_device = torch.device(device)
+        self.blocks.to("cpu")
+        for name, child in self.named_children():
+            if name != "blocks":
+                child.to(self.block_offload_device)
+        return self
     
     def load_lora(self, lora_path, lora_key, multiplier=1.0, lora_network_dim=128, lora_network_alpha=64):
         lora_network_state_dict_loaded = load_file(lora_path, device="cpu")
@@ -480,6 +492,8 @@ class LongCatVideoAvatarTransformer3DModel(
         # blocks
         kv_cache_dict_ret = {}
         for i, block in enumerate(self.blocks):
+            if self.sequential_block_cpu_offload:
+                block.to(self.block_offload_device)
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 block_outputs = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, t, y_seqlens,
@@ -490,6 +504,10 @@ class LongCatVideoAvatarTransformer3DModel(
                     hidden_states, encoder_hidden_states, t, y_seqlens,
                     (N_t, N_h, N_w), num_cond_latents, return_kv, kv_cache_dict.get(i, None), skip_crs_attn, num_ref_latents, audio_hidden_states, ref_img_index, mask_frame_range, token_ref_target_masks, human_num
                 )
+
+            if self.sequential_block_cpu_offload:
+                block.to("cpu")
+                torch.cuda.empty_cache()
             
             if return_kv:
                 hidden_states, kv_cache = block_outputs

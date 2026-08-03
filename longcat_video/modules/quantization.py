@@ -6,6 +6,7 @@ from typing import Optional, Set
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import save_file, load_file
 
 
@@ -155,7 +156,88 @@ def save_quantized_state_dict(model: nn.Module, save_dir: str, config_source_dir
     print(f"Saved {len(shards)} shard(s) to {save_dir}")
 
 
-def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", **kwargs):
+def _replace_linear_with_empty_quantized(model: nn.Module):
+    """Replace Linear layers without first materializing their quantized weights."""
+    modules_to_replace = {}
+    for name, module in model.named_modules():
+        if isinstance(module, nn.Linear):
+            should_skip = any(pattern in name for pattern in DEFAULT_SKIP_PATTERNS)
+            if not should_skip:
+                modules_to_replace[name] = QuantizedLinear(
+                    module.in_features,
+                    module.out_features,
+                    bias=module.bias is not None,
+                )
+
+    for name, quantized_linear in modules_to_replace.items():
+        parts = name.split(".")
+        parent = model
+        for part in parts[:-1]:
+            parent = getattr(parent, part)
+        setattr(parent, parts[-1], quantized_linear)
+
+
+def merge_lora_into_quantized_model(model: nn.Module, lora_path: str, multiplier: float = 1.0) -> int:
+    """Merge a LoRA checkpoint into INT8 weights and requantize them in-place.
+
+    This removes the need to keep the LoRA modules resident during inference.
+    It is intended for weight-only INT8 inference where the base weights are
+    already approximate.
+    """
+    merged = 0
+    with safe_open(lora_path, framework="pt", device="cpu") as lora_file:
+        keys = set(lora_file.keys())
+        down_keys = sorted(key for key in keys if key.endswith(".lora_down.weight"))
+
+        for down_key in down_keys:
+            prefix = down_key[: -len(".lora_down.weight")]
+            module_name = prefix.replace("lora___lorahyphen___", "").replace("___lorahyphen___", ".")
+
+            module = model
+            for part in module_name.split("."):
+                module = getattr(module, part)
+            if not isinstance(module, QuantizedLinear):
+                raise TypeError(f"LoRA target {module_name} is not QuantizedLinear: {type(module).__name__}")
+
+            down = lora_file.get_tensor(down_key).float()
+            block_prefix = prefix + ".lora_up.blocks."
+            block_keys = sorted(
+                (key for key in keys if key.startswith(block_prefix) and key.endswith(".weight")),
+                key=lambda key: int(key[len(block_prefix):].split(".", 1)[0]),
+            )
+            if block_keys:
+                rank = down.shape[0] // len(block_keys)
+                delta = torch.cat(
+                    [
+                        lora_file.get_tensor(key).float()
+                        @ down[index * rank : (index + 1) * rank]
+                        for index, key in enumerate(block_keys)
+                    ],
+                    dim=0,
+                )
+            else:
+                up = lora_file.get_tensor(prefix + ".lora_up.weight").float()
+                delta = up @ down
+
+            alpha_key = prefix + ".alpha_scale"
+            alpha_scale = float(lora_file.get_tensor(alpha_key)) if alpha_key in keys else 1.0
+            base_weight = module.weight_int8.float() * module.weight_scale.float().unsqueeze(1)
+            merged_weight = base_weight.add_(delta, alpha=multiplier * alpha_scale)
+            scale = merged_weight.abs().amax(dim=1).clamp(min=1e-8) / 127.0
+            module.weight_int8 = (merged_weight / scale.unsqueeze(1)).round().clamp(-128, 127).to(torch.int8)
+            module.weight_scale = scale
+            merged += 1
+
+    return merged
+
+
+def load_quantized_dit(
+    checkpoint_dir: str,
+    subfolder: str = "base_model_int8",
+    low_cpu_mem_usage: bool = False,
+    device: Optional[str] = None,
+    **kwargs,
+):
     """Load a quantized DiT model.
 
     Args:
@@ -184,25 +266,13 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
     # Override with kwargs
     config.update(kwargs)
 
-    # Instantiate model (empty weights)
-    model = LongCatVideoAvatarTransformer3DModel(**config)
-
-    # Replace Linear layers with QuantizedLinear (empty)
-    skip_patterns = DEFAULT_SKIP_PATTERNS
-    modules_to_replace = {}
-    for name, module in model.named_modules():
-        if isinstance(module, nn.Linear):
-            should_skip = any(pattern in name for pattern in skip_patterns)
-            if not should_skip:
-                ql = QuantizedLinear(module.in_features, module.out_features, bias=module.bias is not None)
-                modules_to_replace[name] = ql
-
-    for name, ql in modules_to_replace.items():
-        parts = name.split(".")
-        parent = model
-        for part in parts[:-1]:
-            parent = getattr(parent, part)
-        setattr(parent, parts[-1], ql)
+    if low_cpu_mem_usage:
+        with torch.device("meta"):
+            model = LongCatVideoAvatarTransformer3DModel(**config)
+            _replace_linear_with_empty_quantized(model)
+    else:
+        model = LongCatVideoAvatarTransformer3DModel(**config)
+        _replace_linear_with_empty_quantized(model)
 
     # Load quantized state dict
     index_path = os.path.join(quantized_dir, "quantized_model.safetensors.index.json")
@@ -211,11 +281,30 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
             index = json.load(f)
         # Load from shards
         shard_files = set(index["weight_map"].values())
-        state_dict = {}
-        for shard_file in sorted(shard_files):
-            shard_path = os.path.join(quantized_dir, shard_file)
-            shard_dict = load_file(shard_path, device="cpu")
-            state_dict.update(shard_dict)
+        if low_cpu_mem_usage:
+            expected_keys = set(model.state_dict().keys())
+            loaded_keys = set()
+            target_device = device or "cpu"
+            for shard_file in sorted(shard_files):
+                shard_path = os.path.join(quantized_dir, shard_file)
+                shard_dict = load_file(shard_path, device=target_device)
+                model.load_state_dict(shard_dict, strict=False, assign=True)
+                loaded_keys.update(shard_dict.keys())
+                del shard_dict
+            missing_keys = expected_keys - loaded_keys
+            unexpected_keys = loaded_keys - expected_keys
+            if missing_keys or unexpected_keys:
+                raise RuntimeError(
+                    f"Quantized checkpoint key mismatch: missing={sorted(missing_keys)[:10]}, "
+                    f"unexpected={sorted(unexpected_keys)[:10]}"
+                )
+            state_dict = None
+        else:
+            state_dict = {}
+            for shard_file in sorted(shard_files):
+                shard_path = os.path.join(quantized_dir, shard_file)
+                shard_dict = load_file(shard_path, device="cpu")
+                state_dict.update(shard_dict)
     else:
         # Single file fallback
         files = [f for f in os.listdir(quantized_dir) if f.endswith(".safetensors") and "index" not in f]
@@ -224,7 +313,8 @@ def load_quantized_dit(checkpoint_dir: str, subfolder: str = "base_model_int8", 
             shard_dict = load_file(os.path.join(quantized_dir, f), device="cpu")
             state_dict.update(shard_dict)
 
-    model.load_state_dict(state_dict, strict=True)
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=True)
     model.eval()
 
     # Cast non-quantized parameters (Conv3d, LayerNorm, etc.) to bfloat16

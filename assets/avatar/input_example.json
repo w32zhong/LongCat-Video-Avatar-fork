@@ -1,0 +1,7 @@
+{
+    "prompt": "A person speaking naturally to the camera.",
+    "cond_image": "/path/to/reference_image.png",
+    "cond_audio": {
+        "person1": "/path/to/speech.wav"
+    }
+}
