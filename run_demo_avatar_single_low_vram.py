@@ -46,6 +46,8 @@ def _load_case(input_json: str):
         case = json.load(handle)
     if not isinstance(case.get("prompt"), str) or not case["prompt"].strip():
         raise ValueError("input JSON must contain a non-empty 'prompt' string")
+    if not isinstance(case.get("negative_prompt"), str) or not case["negative_prompt"].strip():
+        raise ValueError("input JSON must contain a non-empty 'negative_prompt' string")
     image_path = _resolve_input_path(case["cond_image"])
     audio_path = _resolve_input_path(case["cond_audio"]["person1"])
     return case, image_path, audio_path
@@ -89,17 +91,30 @@ def _encode_prompt(case, foundation_dir, device):
         dit=None,
         model_type="avatar-v1.5",
     )
-    prompt_embeds, prompt_attention_mask, _, _ = text_pipe.encode_prompt(
+    (
+        prompt_embeds,
+        prompt_attention_mask,
+        negative_prompt_embeds,
+        negative_prompt_attention_mask,
+    ) = text_pipe.encode_prompt(
         prompt=case["prompt"],
-        do_classifier_free_guidance=False,
+        negative_prompt=case["negative_prompt"],
+        do_classifier_free_guidance=True,
         device=device,
         dtype=torch.bfloat16,
     )
     prompt_embeds = prompt_embeds.cpu()
     prompt_attention_mask = prompt_attention_mask.cpu()
+    negative_prompt_embeds = negative_prompt_embeds.cpu()
+    negative_prompt_attention_mask = negative_prompt_attention_mask.cpu()
     del text_pipe, text_encoder, tokenizer
     _clear_cuda()
-    return prompt_embeds, prompt_attention_mask
+    return (
+        prompt_embeds,
+        prompt_attention_mask,
+        negative_prompt_embeds,
+        negative_prompt_attention_mask,
+    )
 
 
 @torch.inference_mode()
@@ -114,8 +129,15 @@ def prepare(args):
     if args.skip_text_encoder:
         prompt_embeds = torch.zeros(1, 1, 512, 4096, dtype=torch.bfloat16)
         prompt_attention_mask = torch.zeros(1, 512, dtype=torch.int64)
+        negative_prompt_embeds = torch.zeros_like(prompt_embeds)
+        negative_prompt_attention_mask = torch.zeros_like(prompt_attention_mask)
     else:
-        prompt_embeds, prompt_attention_mask = _encode_prompt(case, foundation_dir, device)
+        (
+            prompt_embeds,
+            prompt_attention_mask,
+            negative_prompt_embeds,
+            negative_prompt_attention_mask,
+        ) = _encode_prompt(case, foundation_dir, device)
     print(f"[prepare] prompt embedding ready: {tuple(prompt_embeds.shape)}", flush=True)
 
     image = load_image(image_path)
@@ -215,11 +237,14 @@ def prepare(args):
             "audio_emb": audio_emb,
             "prompt_embeds": prompt_embeds,
             "prompt_attention_mask": prompt_attention_mask,
+            "negative_prompt_embeds": negative_prompt_embeds,
+            "negative_prompt_attention_mask": negative_prompt_attention_mask,
             "height": height,
             "width": width,
             "image_path": image_path,
             "audio_path": audio_path,
-            "prompt": case.get("prompt", ""),
+            "prompt": case["prompt"],
+            "negative_prompt": case["negative_prompt"],
             "num_frames": num_frames,
             "fps": args.fps,
         },
@@ -298,18 +323,20 @@ def denoise(args):
     latent = pipe.generate_ai2v(
         image=image,
         prompt=cache["prompt"],
-        negative_prompt=None,
+        negative_prompt=cache["negative_prompt"],
         resolution=args.resolution,
         num_frames=num_frames,
         num_inference_steps=8,
         use_distill=True,
-        text_guidance_scale=1.0,
+        text_guidance_scale=args.text_guidance_scale,
         audio_guidance_scale=1.0,
         generator=generator,
         output_type="latent",
         audio_emb=cache["audio_emb"],
         prompt_embeds=cache["prompt_embeds"],
         prompt_attention_mask=cache["prompt_attention_mask"],
+        negative_prompt_embeds=cache["negative_prompt_embeds"],
+        negative_prompt_attention_mask=cache["negative_prompt_attention_mask"],
         condition_latents=cache["condition_latents"],
     )
     if rank == 0:
@@ -373,6 +400,7 @@ def parse_args():
     parser.add_argument("--sequential_block_cpu_offload", action="store_true")
     parser.add_argument("--block_offload_group_size", type=int, default=4)
     parser.add_argument("--skip_text_encoder", action="store_true")
+    parser.add_argument("--text_guidance_scale", type=float, default=1.0)
     return parser.parse_args()
 
 

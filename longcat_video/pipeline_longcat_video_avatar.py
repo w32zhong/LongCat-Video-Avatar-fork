@@ -890,6 +890,8 @@ class LongCatVideoAvatarPipeline:
         resize_mode: Optional[str] = "crop", # "default" / "crop"
         prompt_embeds: Optional[torch.Tensor] = None,
         prompt_attention_mask: Optional[torch.Tensor] = None,
+        negative_prompt_embeds: Optional[torch.Tensor] = None,
+        negative_prompt_attention_mask: Optional[torch.Tensor] = None,
         condition_latents: Optional[torch.Tensor] = None,
     ):
         r"""
@@ -984,8 +986,14 @@ class LongCatVideoAvatarPipeline:
                 raise ValueError("prompt_attention_mask is required with prompt_embeds")
             prompt_embeds = prompt_embeds.to(device=device, dtype=dit_dtype)
             prompt_attention_mask = prompt_attention_mask.to(device=device)
-            negative_prompt_embeds = None
-            negative_prompt_attention_mask = None
+            if self.do_classifier_free_guidance:
+                if negative_prompt_embeds is None or negative_prompt_attention_mask is None:
+                    raise ValueError("negative prompt embeddings are required for text CFG")
+                negative_prompt_embeds = negative_prompt_embeds.to(device=device, dtype=dit_dtype)
+                negative_prompt_attention_mask = negative_prompt_attention_mask.to(device=device)
+            else:
+                negative_prompt_embeds = None
+                negative_prompt_attention_mask = None
         elif context_parallel_util.get_cp_rank() == 0:
             (
                 prompt_embeds, 

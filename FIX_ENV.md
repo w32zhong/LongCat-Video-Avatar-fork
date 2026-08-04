@@ -125,6 +125,7 @@ export CUDA_DEVICE_ORDER=PCI_BUS_ID
 ```json
 {
   "prompt": "A cartoon livestream host speaks energetically to the camera, naturally moving the head, blinking, smiling, and making subtle upper-body gestures.",
+  "negative_prompt": "static image, frozen pose, motionless head, stiff expression, no blinking, no facial movement",
   "cond_image": "/path/to/reference_image.png",
   "cond_audio": {
     "person1": "/path/to/speech.wav"
@@ -182,6 +183,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   --latent_path "$OUTPUT_DIR/latent.pt" \
   --context_parallel_size 4 \
   --dit_subfolder base_model_int8_dmd_merged \
+  --text_guidance_scale 3.0 \
   --sequential_block_cpu_offload \
   --block_offload_group_size 32
 ```
