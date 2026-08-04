@@ -114,7 +114,8 @@ conda activate longcat-video-cu124
 CHECKPOINT_DIR=/path/to/model-store/meituan-longcat/LongCat-Video-Avatar-1.5
 INPUT_JSON=assets/avatar/input_example.json
 OUTPUT_DIR=outputs_avatar_run
-GPUS=0,1,2,3
+GPUS=0,1,3,4
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 ```
 
 默认输出帧率为 25 FPS；脚本根据音频时长自动计算生成帧数。
@@ -123,7 +124,7 @@ GPUS=0,1,2,3
 
 ```json
 {
-  "prompt": "A person speaking to the camera.",
+  "prompt": "A cartoon livestream host speaks energetically to the camera, naturally moving the head, blinking, smiling, and making subtle upper-body gestures.",
   "cond_image": "/path/to/reference_image.png",
   "cond_audio": {
     "person1": "/path/to/speech.wav"
@@ -135,17 +136,28 @@ GPUS=0,1,2,3
 
 此阶段只做预处理，不生成视频：
 
+- 用四张 GPU 运行 UMT5 text encoder，将 prompt 编码后卸载 text encoder。
 - 将图片裁剪到目标分辨率，用 VAE 编码为 `condition_latents`。
 - 用 `Kim_Vocal_2.onnx` 分离人声，并重采样到 16 kHz。
 - 用 Whisper-large-v3 提取按 25 FPS 对齐的音频 embedding，用于控制嘴型。
 - 将图片 latent、音频 embedding 和输入信息保存到 `inputs.pt`。
-- 保存后释放 VAE 和 Whisper，再进入 DiT 去噪，避免这些模型同时占用显存导致 OOM。
+- 保存后释放 UMT5、VAE 和 Whisper，再进入 DiT 去噪，避免这些模型同时占用显存导致 OOM。
+
+```bash
+CUDA_VISIBLE_DEVICES="$GPUS" python run_demo_avatar_single_low_vram.py prepare \
+  --input_json "$INPUT_JSON" \
+  --checkpoint_dir "$CHECKPOINT_DIR" \
+  --cache_path "$OUTPUT_DIR/inputs.pt"
+```
+
+默认使用真实 prompt。若要跳过 text encoder 并使用零 prompt embedding：
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py prepare \
   --input_json "$INPUT_JSON" \
   --checkpoint_dir "$CHECKPOINT_DIR" \
-  --cache_path "$OUTPUT_DIR/inputs.pt"
+  --cache_path "$OUTPUT_DIR/inputs.pt" \
+  --skip_text_encoder
 ```
 
 2. 四卡去噪：
@@ -156,7 +168,7 @@ CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py prepare \
 - 输入 `base_model_int8_dmd_merged`、随机噪声和固定 seed。
 - 四张 GPU 通过 Context Parallel 分担视频 token 计算。
 - INT8 DiT 执行 8 步蒸馏去噪；音频 embedding 控制嘴型和说话动作。
-- DiT block 每组 4 层从 CPU 移到 GPU，计算完一组后再移回 CPU。
+- DiT block 每组 n 层从 CPU 移到 GPU，计算完一组后再移回 CPU。
 - 输出 `latent.pt`：生成视频的压缩表示，不能直接播放。
 
 ```bash
@@ -171,7 +183,7 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   --context_parallel_size 4 \
   --dit_subfolder base_model_int8_dmd_merged \
   --sequential_block_cpu_offload \
-  --block_offload_group_size 4
+  --block_offload_group_size 32
 ```
 
 3. 解码：
@@ -206,7 +218,7 @@ CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py decode \
 ### `longcat_video/modules/avatar/longcat_video_dit_avatar.py`
 
 - 增加 `enable_sequential_block_cpu_offload()`。
-- 每次将 4 个 DiT block 移到 GPU，连续计算后再移回 CPU。
+- 每次将 n 个 DiT block 移到 GPU，连续计算后再移回 CPU。
 - 默认关闭，不影响原调用方式。
 
 ### `longcat_video/pipeline_longcat_video_avatar.py`
@@ -217,13 +229,13 @@ CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py decode \
 - `prompt_attention_mask`
 - `condition_latents`
 
-用于跳过 text encoder，并将 VAE 编码与 DiT 去噪拆开。
+用于把 text encoder、VAE 编码与 DiT 去噪拆成不同阶段，避免同时占用显存。
 
 ### `run_demo_avatar_single_low_vram.py`
 
 新增三阶段低显存入口：
 
-- `prepare`：VAE 图片编码、人声分离、Whisper 音频编码。
+- `prepare`：四卡 UMT5 prompt 编码、VAE 图片编码、人声分离、Whisper 音频编码。
 - `denoise`：四卡 Context Parallel、INT8 DMD、8 步蒸馏、block offload。
 - `decode`：单卡 tiled VAE 解码和音频封装。
 - `prepare`、`decode` 使用 `torch.inference_mode()`。

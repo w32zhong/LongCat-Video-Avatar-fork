@@ -1,5 +1,5 @@
 {
-    "prompt": "A person speaking naturally to the camera.",
+    "prompt": "A cartoon livestream host speaks energetically to the camera, naturally moving the head, blinking, smiling, and making subtle upper-body gestures.",
     "cond_image": "/path/to/reference_image.png",
     "cond_audio": {
         "person1": "/path/to/speech.wav"

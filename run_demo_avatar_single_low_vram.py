@@ -14,6 +14,7 @@ import torch
 import torch.distributed as dist
 from audio_separator.separator import Separator
 from diffusers.utils import load_image
+from transformers import AutoTokenizer, UMT5EncoderModel
 
 from longcat_video.audio_process import get_audio_encoder, get_audio_feature_extractor
 from longcat_video.audio_process.torch_utils import save_video_ffmpeg
@@ -34,13 +35,17 @@ def _resolve_input_path(path: str) -> str:
 def _clear_cuda():
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        for device_index in range(torch.cuda.device_count()):
+            with torch.cuda.device(device_index):
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
 
 
 def _load_case(input_json: str):
     with open(input_json, "r", encoding="utf-8") as handle:
         case = json.load(handle)
+    if not isinstance(case.get("prompt"), str) or not case["prompt"].strip():
+        raise ValueError("input JSON must contain a non-empty 'prompt' string")
     image_path = _resolve_input_path(case["cond_image"])
     audio_path = _resolve_input_path(case["cond_audio"]["person1"])
     return case, image_path, audio_path
@@ -51,6 +56,52 @@ def _num_frames_for_audio(audio_duration: float, fps: int) -> int:
     return math.ceil((required_frames - 1) / 4) * 4 + 1
 
 
+def _encode_prompt(case, foundation_dir, device):
+    text_encoder_dir = foundation_dir / "text_encoder"
+    expected_shards = [
+        text_encoder_dir / f"model-{index:05d}-of-00005.safetensors"
+        for index in range(1, 6)
+    ]
+    missing_shards = [str(path) for path in expected_shards if not path.is_file()]
+    if missing_shards:
+        raise FileNotFoundError(
+            "Missing UMT5 text encoder shards:\n" + "\n".join(missing_shards)
+        )
+    if torch.cuda.device_count() < 4:
+        raise RuntimeError("Prompt encoding requires four visible GPUs.")
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(foundation_dir), subfolder="tokenizer", local_files_only=True
+    )
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        str(foundation_dir),
+        subfolder="text_encoder",
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        device_map="balanced",
+        local_files_only=True,
+    ).eval()
+    text_pipe = LongCatVideoAvatarPipeline(
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+        vae=None,
+        scheduler=None,
+        dit=None,
+        model_type="avatar-v1.5",
+    )
+    prompt_embeds, prompt_attention_mask, _, _ = text_pipe.encode_prompt(
+        prompt=case["prompt"],
+        do_classifier_free_guidance=False,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    prompt_embeds = prompt_embeds.cpu()
+    prompt_attention_mask = prompt_attention_mask.cpu()
+    del text_pipe, text_encoder, tokenizer
+    _clear_cuda()
+    return prompt_embeds, prompt_attention_mask
+
+
 @torch.inference_mode()
 def prepare(args):
     device = torch.device(args.device)
@@ -59,6 +110,13 @@ def prepare(args):
     foundation_dir = checkpoint_dir.parent / "LongCat-Video"
     cache_path = Path(args.cache_path)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.skip_text_encoder:
+        prompt_embeds = torch.zeros(1, 1, 512, 4096, dtype=torch.bfloat16)
+        prompt_attention_mask = torch.zeros(1, 512, dtype=torch.int64)
+    else:
+        prompt_embeds, prompt_attention_mask = _encode_prompt(case, foundation_dir, device)
+    print(f"[prepare] prompt embedding ready: {tuple(prompt_embeds.shape)}", flush=True)
 
     image = load_image(image_path)
     vae = AutoencoderKLWan.from_pretrained(
@@ -151,8 +209,6 @@ def prepare(args):
     _clear_cuda()
     print(f"[prepare] audio embedding ready: {tuple(audio_emb.shape)}", flush=True)
 
-    prompt_embeds = torch.zeros(1, 1, 512, 4096, dtype=torch.bfloat16)
-    prompt_attention_mask = torch.zeros(1, 512, dtype=torch.int64)
     torch.save(
         {
             "condition_latents": condition_latents,
@@ -241,7 +297,7 @@ def denoise(args):
 
     latent = pipe.generate_ai2v(
         image=image,
-        prompt=cache.get("prompt") or "A person speaking naturally.",
+        prompt=cache["prompt"],
         negative_prompt=None,
         resolution=args.resolution,
         num_frames=num_frames,
@@ -316,6 +372,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--sequential_block_cpu_offload", action="store_true")
     parser.add_argument("--block_offload_group_size", type=int, default=4)
+    parser.add_argument("--skip_text_encoder", action="store_true")
     return parser.parse_args()
 
 
