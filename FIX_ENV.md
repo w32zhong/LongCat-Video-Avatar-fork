@@ -156,7 +156,7 @@ CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py prepare \
 - 输入 `base_model_int8_dmd_merged`、随机噪声和固定 seed。
 - 四张 GPU 通过 Context Parallel 分担视频 token 计算。
 - INT8 DiT 执行 8 步蒸馏去噪；音频 embedding 控制嘴型和说话动作。
-- DiT block 逐层从 CPU 移到 GPU，避免显存 OOM。
+- DiT block 每组 4 层从 CPU 移到 GPU，计算完一组后再移回 CPU。
 - 输出 `latent.pt`：生成视频的压缩表示，不能直接播放。
 
 ```bash
@@ -170,7 +170,8 @@ python -m torch.distributed.run --standalone --nproc_per_node=4 \
   --latent_path "$OUTPUT_DIR/latent.pt" \
   --context_parallel_size 4 \
   --dit_subfolder base_model_int8_dmd_merged \
-  --sequential_block_cpu_offload
+  --sequential_block_cpu_offload \
+  --block_offload_group_size 4
 ```
 
 3. 解码：
@@ -205,7 +206,7 @@ CUDA_VISIBLE_DEVICES=0 python run_demo_avatar_single_low_vram.py decode \
 ### `longcat_video/modules/avatar/longcat_video_dit_avatar.py`
 
 - 增加 `enable_sequential_block_cpu_offload()`。
-- DiT block 在执行前移到 GPU，执行后移回 CPU。
+- 每次将 4 个 DiT block 移到 GPU，连续计算后再移回 CPU。
 - 默认关闭，不影响原调用方式。
 
 ### `longcat_video/pipeline_longcat_video_avatar.py`

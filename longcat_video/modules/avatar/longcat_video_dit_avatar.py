@@ -292,11 +292,15 @@ class LongCatVideoAvatarTransformer3DModel(
         self.active_loras = []
         self.sequential_block_cpu_offload = False
         self.block_offload_device = None
+        self.block_offload_group_size = 1
 
-    def enable_sequential_block_cpu_offload(self, device):
-        """Keep transformer blocks on CPU and stage one block at a time on GPU."""
+    def enable_sequential_block_cpu_offload(self, device, group_size=4):
+        """Keep transformer blocks on CPU and stage a group of blocks on GPU."""
+        if group_size < 1:
+            raise ValueError(f"group_size must be at least 1, got {group_size}")
         self.sequential_block_cpu_offload = True
         self.block_offload_device = torch.device(device)
+        self.block_offload_group_size = min(group_size, len(self.blocks))
         self.blocks.to("cpu")
         for name, child in self.named_children():
             if name != "blocks":
@@ -492,8 +496,10 @@ class LongCatVideoAvatarTransformer3DModel(
         # blocks
         kv_cache_dict_ret = {}
         for i, block in enumerate(self.blocks):
-            if self.sequential_block_cpu_offload:
-                block.to(self.block_offload_device)
+            if self.sequential_block_cpu_offload and i % self.block_offload_group_size == 0:
+                group_end = min(i + self.block_offload_group_size, len(self.blocks))
+                for block_index in range(i, group_end):
+                    self.blocks[block_index].to(self.block_offload_device)
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 block_outputs = self._gradient_checkpointing_func(
                     block, hidden_states, encoder_hidden_states, t, y_seqlens,
@@ -505,9 +511,12 @@ class LongCatVideoAvatarTransformer3DModel(
                     (N_t, N_h, N_w), num_cond_latents, return_kv, kv_cache_dict.get(i, None), skip_crs_attn, num_ref_latents, audio_hidden_states, ref_img_index, mask_frame_range, token_ref_target_masks, human_num
                 )
 
-            if self.sequential_block_cpu_offload:
-                block.to("cpu")
-                torch.cuda.empty_cache()
+            if self.sequential_block_cpu_offload and (
+                (i + 1) % self.block_offload_group_size == 0 or i + 1 == len(self.blocks)
+            ):
+                group_start = (i // self.block_offload_group_size) * self.block_offload_group_size
+                for block_index in range(group_start, i + 1):
+                    self.blocks[block_index].to("cpu")
             
             if return_kv:
                 hidden_states, kv_cache = block_outputs

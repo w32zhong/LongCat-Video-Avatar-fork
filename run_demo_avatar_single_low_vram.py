@@ -210,7 +210,14 @@ def denoise(args):
                 cp_split_hw=cp_split_hw,
             )
             if args.sequential_block_cpu_offload:
-                dit.enable_sequential_block_cpu_offload(device)
+                dit.enable_sequential_block_cpu_offload(
+                    device,
+                    group_size=args.block_offload_group_size,
+                )
+                print(
+                    f"[rank {rank}] block CPU offload group size: {args.block_offload_group_size}",
+                    flush=True,
+                )
         dist.barrier()
 
     scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
@@ -308,6 +315,7 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--sequential_block_cpu_offload", action="store_true")
+    parser.add_argument("--block_offload_group_size", type=int, default=4)
     return parser.parse_args()
 
 
